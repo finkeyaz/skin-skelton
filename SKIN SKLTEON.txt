@@ -1,0 +1,874 @@
+--═════════════════════════════════════════════════════════════════════
+--  💀 SKIN SQUELETTE RC v4.1 💀  (version ARTEMIS ROYALE)
+--  Bundle : https://www.roblox.com/fr/bundles/15021396217542/Squelette
+--
+--  v4.1 RC :
+--    • OUTILS JAMAIS masqués -> la pioche reste visible en main
+--
+--  v4 RC :
+--    • PLUS AUCUN REFRESH AUTO -> touche P pour réappliquer / recalibrer
+--    • rappel à l'écran toutes les 15 s, affiché 3 s,
+--      avec animation d'apparition et de disparition
+--    • bras / avant-bras / mains : squelette 100% CHAÎNÉ segment par
+--      segment -> mains collées aux avant-bras, plus de membres flottants
+--    • ancrage canonique R6 (Left Arm, Torso, ...) avant la proximité
+--    • OUTILS (pioche, armes, ...) JAMAIS masqués : la pioche reste
+--      visible quand tu l'équipes
+--    • vrai skin masqué UNE SEULE fois par perso (fix fuite de listeners)
+--    • GetHumanoidDescriptionFromBundleId prioritaire, HTTP en secours
+--    • panel secret : touche MAJ DROITE -> 6 couleurs
+--    • 100% client : le serveur ne voit rien
+--═════════════════════════════════════════════════════════════════════
+
+local BUNDLE_ID = 15021396217542
+
+-- "me"     = seulement toi (recommandé)
+-- "all"    = tous les joueurs
+-- "others" = tous sauf toi
+-- ou le pseudo exact d'un joueur : CIBLE = "pseudo"
+local CIBLE = "me"
+
+-- HAUTEUR du squelette (pieds -> tête). Largeur/épaisseur normales.
+local HAUTEUR = 1.5
+
+-- Touche pour RAFRAÎCHIR / réappliquer le skin (plus de refresh auto)
+-- (mets Enum.KeyCode.T ici si tu préfères la touche T)
+local TOUCHE_REFRESH = Enum.KeyCode.P
+
+-- Rappel à l'écran "P pour refresh" :
+--   toutes les RAPPEL_INTERVALLE secondes, affiché RAPPEL_DUREE secondes,
+--   animé à l'apparition et à la disparition
+local RAPPEL_ACTIF       = true
+local RAPPEL_INTERVALLE  = 15
+local RAPPEL_DUREE       = 3
+
+-- Touche pour ouvrir le panel secret des couleurs
+local TOUCHE_PANEL = Enum.KeyCode.RightShift
+
+--═════════════════════════════════════════════════════════════════════
+
+local Players          = game:GetService("Players")
+local HttpService      = game:GetService("HttpService")
+local Marketplace      = game:GetService("MarketplaceService")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+
+--────────────────────────────────────────────
+-- 1) Description du squelette
+--    a) Players:GetHumanoidDescriptionFromBundleId (natif, fiable)
+--    b) secours : HTTP + catalogue pièce par pièce
+--────────────────────────────────────────────
+
+local description
+do
+    local okB, descB = pcall(function()
+        return Players:GetHumanoidDescriptionFromBundleId(BUNDLE_ID)
+    end)
+    if okB and descB then
+        description = descB
+        print("[Skin] ✅ Bundle chargé (méthode native GetHumanoidDescriptionFromBundleId)")
+    end
+end
+
+if not description then
+    print("[Skin] ℹ️ Méthode native KO, on tente le secours HTTP...")
+
+    local httpReq = (syn and syn.request)
+        or (http and http.request)
+        or http_request
+        or request
+
+    if type(httpReq) ~= "function" then
+        warn("[Skin] ❌ Pas de HTTP dispo sur ton executor (syn.request / http.request / http_request / request)")
+    else
+        local function httpGet(url)
+            local res = httpReq({ Url = url, Method = "GET" })
+            return res and res.Body or nil
+        end
+
+        local function fetchItemsBundle()
+            local urls = {
+                ("https://catalog.roblox.com/v1/bundles/%d/details"):format(BUNDLE_ID),
+                ("https://catalog.roblox.com/v1/bundles/details?bundleIds=%d"):format(BUNDLE_ID),
+                ("https://apis.roblox.com/catalog/v1/bundles/%d/details"):format(BUNDLE_ID),
+            }
+            for _, url in ipairs(urls) do
+                local ok, body = pcall(httpGet, url)
+                if ok and body and #body > 2 and not body:find('"errors"') then
+                    local okD, data = pcall(function()
+                        return HttpService:JSONDecode(body)
+                    end)
+                    if okD and type(data) == "table" then
+                        local items = data.items
+                        if not items and type(data.data) == "table"
+                           and type(data.data[1]) == "table" then
+                            items = data.data[1].items
+                        end
+                        if type(items) == "table" then
+                            print("[Skin] ✅ Bundle trouvé via : " .. url)
+                            return items
+                        end
+                    end
+                else
+                    print("[Skin] ℹ️ Endpoint KO : " .. url)
+                end
+            end
+            return nil
+        end
+
+        local CORPS = {
+            [17] = "Head",     -- Tête
+            [27] = "Torso",    -- Torse
+            [28] = "RightArm", -- Bras droit
+            [29] = "LeftArm",  -- Bras gauche
+            [30] = "LeftLeg",  -- Jambe gauche
+            [31] = "RightLeg", -- Jambe droite
+        }
+
+        local function construireDescription(items)
+            -- 1) Le bundle contient parfois un outfit complet (UserOutfit)
+            for _, item in ipairs(items) do
+                if item.type == "UserOutfit" then
+                    local ok, desc = pcall(function()
+                        return Players:GetHumanoidDescriptionFromOutfitId(item.id)
+                    end)
+                    if ok and desc then
+                        print("[Skin] ✅ Outfit complet du bundle utilisé (id " .. item.id .. ")")
+                        return desc
+                    end
+                end
+            end
+
+            -- 2) Sinon on reconstruit le skin pièce par pièce
+            local desc = Instance.new("HumanoidDescription")
+            local accessoires = {}
+            local nbPieces = 0
+
+            for _, item in ipairs(items) do
+                if item.type == "Asset" then
+                    local ok, info = pcall(function()
+                        return Marketplace:GetProductInfo(item.id)
+                    end)
+                    if ok and info and info.AssetTypeId then
+                        local champ = CORPS[info.AssetTypeId]
+                        if champ then
+                            desc[champ] = tostring(item.id)
+                            nbPieces = nbPieces + 1
+                            print("[Skin] 🦴 " .. champ .. " -> " .. tostring(item.id)
+                                .. " (" .. tostring(info.Name) .. ")")
+                        else
+                            table.insert(accessoires, tostring(item.id))
+                            print("[Skin] 🎩 Accessoire -> " .. tostring(item.id)
+                                .. " (" .. tostring(info.Name) .. ")")
+                        end
+                    else
+                        print("[Skin] ℹ️ Asset " .. tostring(item.id) .. " introuvable")
+                    end
+                end
+            end
+
+            if #accessoires > 0 then
+                desc.AccessoryIds = table.concat(accessoires, ",")
+            end
+
+            if nbPieces == 0 and #accessoires == 0 then
+                warn("[Skin] ❌ Aucune pièce trouvée dans le bundle")
+                return nil
+            end
+
+            return desc
+        end
+
+        local items = fetchItemsBundle()
+        if items then
+            description = construireDescription(items)
+        end
+    end
+end
+
+if not description then
+    warn("[Skin] ❌ Impossible de récupérer le contenu du bundle (API injoignable)")
+    return
+end
+
+-- AGRANDISSEMENT : hauteur uniquement (pieds -> tête)
+description.HeightScale = HAUTEUR
+description.WidthScale = 1
+description.DepthScale = 1
+print("[Skin] ℹ️ Hauteur du squelette : x" .. HAUTEUR)
+
+--────────────────────────────────────────────
+-- 2) Couleurs
+--────────────────────────────────────────────
+
+local modeCouleur = "blanc" -- blanc | bleu | rouge | violet | rgb | galaxy
+
+local COULEURS = {
+    blanc  = Color3.fromRGB(255, 255, 255),
+    bleu   = Color3.fromRGB(0, 130, 255),
+    rouge  = Color3.fromRGB(255, 45, 45),
+    violet = Color3.fromRGB(170, 0, 255),
+}
+
+local GALAXIE = {
+    Color3.fromRGB(25, 25, 80),   -- bleu nuit
+    Color3.fromRGB(70, 20, 140),  -- violet profond
+    Color3.fromRGB(150, 40, 190), -- magenta spatial
+    Color3.fromRGB(40, 40, 120),  -- indigo
+}
+
+local function getCouleur()
+    if modeCouleur == "rgb" then
+        return Color3.fromHSV((os.clock() * 0.25) % 1, 1, 1)
+    elseif modeCouleur == "galaxy" then
+        local x = (os.clock() * 0.12) % #GALAXIE
+        local i = math.floor(x) + 1
+        local j = (i % #GALAXIE) + 1
+        return GALAXIE[i]:Lerp(GALAXIE[j], x % 1)
+    end
+    return COULEURS[modeCouleur] or COULEURS.blanc
+end
+
+--────────────────────────────────────────────
+-- 2bis) Cibles
+--────────────────────────────────────────────
+
+local function estCible(player)
+    local lp = Players.LocalPlayer
+    if CIBLE == "all"    then return true end
+    if CIBLE == "others" then return player ~= lp end
+    if CIBLE == "me"     then return player == lp end
+    return player.Name:lower() == CIBLE:lower()
+        or player.DisplayName:lower() == CIBLE:lower()
+end
+
+--────────────────────────────────────────────
+-- 3) Masquage du vrai personnage (TOUJOURS, en premier)
+--────────────────────────────────────────────
+
+local clones = {} -- [Player] = { model, sync, char, paires, accessoires }
+
+-- v4.1 : ne JAMAIS masquer les outils (pioche, armes, ...)
+-- sinon la pioche devient invisible dès que tu l'équipes
+local function estDansUnTool(obj)
+    return obj:IsA("Tool") or obj:FindFirstAncestorOfClass("Tool") ~= nil
+end
+
+local function cacherObjet(obj)
+    if estDansUnTool(obj) then return end
+    if obj:IsA("BasePart") then
+        obj.LocalTransparencyModifier = 1
+        obj.Transparency = 1
+    elseif obj:IsA("Decal") then
+        obj.LocalTransparencyModifier = 1
+        obj.Transparency = 1
+    elseif obj:IsA("Accessory") then
+        local h = obj:FindFirstChild("Handle")
+        if h then
+            h.LocalTransparencyModifier = 1
+            h.Transparency = 1
+        end
+    end
+end
+
+-- Si le jeu remet la transparence à zéro, on re-cache immédiatement
+local function protegerPartie(part)
+    if not part:IsA("BasePart") then return end
+    part:GetPropertyChangedSignal("Transparency"):Connect(function()
+        if part.Transparency < 1 and part.Parent then
+            part.Transparency = 1
+        end
+    end)
+end
+
+-- Masque TOUT le personnage, même s'il est custom.
+-- v4 : UNE SEULE fois par personnage -> plus de fuite de listeners
+local persosMasques = {}
+
+local function masquerPerso(character)
+    if not character or not character.Parent then return end
+    if persosMasques[character] then return end
+    persosMasques[character] = true
+
+    local dejaProteges = {}
+    for _, obj in ipairs(character:GetDescendants()) do
+        if not estDansUnTool(obj) then
+            cacherObjet(obj)
+            if obj:IsA("BasePart") then
+                protegerPartie(obj)
+                dejaProteges[obj] = true
+            end
+        end
+    end
+    character.DescendantAdded:Connect(function(obj)
+        if estDansUnTool(obj) then return end
+        cacherObjet(obj)
+        if obj:IsA("BasePart") and not dejaProteges[obj] then
+            dejaProteges[obj] = true
+            protegerPartie(obj)
+        end
+    end)
+    character.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            persosMasques[character] = nil
+        end
+    end)
+
+    print("[Skin] 🫥 Skin réel masqué pour " .. character.Name)
+end
+
+--────────────────────────────────────────────
+-- 4) Clone squelette + calibrage
+--────────────────────────────────────────────
+
+local function detruireClone(player)
+    local c = clones[player]
+    if c then
+        if c.sync then c.sync:Disconnect() end
+        if c.model then c.model:Destroy() end
+        clones[player] = nil
+    end
+end
+
+local function appliquerCouleur()
+    local c = getCouleur()
+    for _, cl in pairs(clones) do
+        local model = cl.model
+        if model and model.Parent then
+            for _, s in ipairs(model:GetDescendants()) do
+                if s:IsA("BasePart") then
+                    s.Color = c
+                end
+            end
+        end
+    end
+end
+
+-- Racine de secours : HumanoidRootPart, sinon PrimaryPart,
+-- sinon n'importe quelle BasePart du perso
+local function trouverRacine(character)
+    local r = character:FindFirstChild("HumanoidRootPart")
+    if not (r and r:IsA("BasePart")) then
+        r = character.PrimaryPart
+    end
+    if not (r and r:IsA("BasePart")) then
+        r = character:FindFirstChildWhichIsA("BasePart", true)
+    end
+    return (r and r:IsA("BasePart")) and r or nil
+end
+
+-- Ancrage canonique : si le vrai perso est R6 (Left Arm, Torso, ...),
+-- les racines de membres du squelette R15 s'y ancrent directement,
+-- AVANT le "plus proche" qui peut se tromper de membre
+local ANCRAGE_R6 = {
+    UpperTorso    = "Torso",
+    LowerTorso    = "Torso",
+    Torso         = "Torso",
+    LeftUpperArm  = "Left Arm",
+    RightUpperArm = "Right Arm",
+    LeftUpperLeg  = "Left Leg",
+    RightUpperLeg = "Right Leg",
+}
+
+-- Association membre squelette -> partie réelle :
+--   1) par nom exact -> copie directe de la partie réelle
+--   2) sinon CHAÎNE -> suit son segment parent squelette
+--      (main -> avant-bras -> bras -> torse, pied -> jambe)
+--      => le squelette reste TOUJOURS connecté :
+--         plus de mains / pieds flottants ou d'écart qui s'ouvre
+--   3) racine de chaîne -> ancre R6 canonique, sinon partie réelle
+--      la plus proche, avec un offset de POSITION UNIQUEMENT
+--      (pas de rotation -> pas de bras tordus)
+--   4) les associations valides sont conservées d'un refresh à l'autre
+local function calibrerPaires(character, clone, anciennesPaires)
+    local reelsNom = {}
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart")
+           and not part:FindFirstAncestorOfClass("Accessory") then
+            reelsNom[part.Name] = part
+        end
+    end
+    local reelsListe = {}
+    for _, p in pairs(reelsNom) do
+        table.insert(reelsListe, p)
+    end
+
+    local ancienneDe = {}
+    if anciennesPaires then
+        for _, pa in ipairs(anciennesPaires) do
+            if pa.squelette and pa.squelette.Parent then
+                ancienneDe[pa.squelette] = pa
+            end
+        end
+    end
+
+    -- parties squelette dans l'ordre hiérarchique (parent avant enfant)
+    local partsSquelette = {}
+    for _, part in ipairs(clone:GetDescendants()) do
+        if part:IsA("BasePart")
+           and not part:FindFirstAncestorOfClass("Accessory") then
+            table.insert(partsSquelette, part)
+        end
+    end
+
+    local paires = {}
+    local pairDe = {} -- [partie squelette] = son association
+
+    for _, part in ipairs(partsSquelette) do
+        local ancienne = ancienneDe[part]
+        local paire
+
+        -- 0) ancienne association (nom/ancre) encore valide ?
+        if ancienne and ancienne.reel and ancienne.reel.Parent
+           and ancienne.reel:IsDescendantOf(character) then
+            paire = ancienne
+
+        else
+            -- 1) correspondance par nom
+            local reel = reelsNom[part.Name]
+            if reel then
+                paire = { squelette = part, reel = reel, offset = CFrame.new() }
+
+            else
+                local parentPart = part.Parent
+                local parentValide = parentPart and parentPart:IsA("BasePart")
+                    and not parentPart:FindFirstAncestorOfClass("Accessory")
+
+                if parentValide and pairDe[parentPart] then
+                    -- 2) CHAÎNE : suit son segment parent squelette
+                    if ancienne and ancienne.suitPart == parentPart
+                       and ancienne.offsetChaine then
+                        paire = ancienne
+                    else
+                        paire = {
+                            squelette = part,
+                            suitPart = parentPart,
+                            offsetChaine = parentPart.CFrame:Inverse() * part.CFrame,
+                        }
+                    end
+                else
+                    -- 3) racine de chaîne : ancre R6 canonique ou proximité
+                    local ancre = (ANCRAGE_R6[part.Name]
+                        and reelsNom[ANCRAGE_R6[part.Name]]) or nil
+                    if not ancre then
+                        local plusProche, dMin
+                        for _, r in ipairs(reelsListe) do
+                            local d = (r.Position - part.Position).Magnitude
+                            if not dMin or d < dMin then
+                                dMin, plusProche = d, r
+                            end
+                        end
+                        ancre = plusProche
+                    end
+                    if ancre then
+                        local rel = ancre.CFrame:Inverse() * part.CFrame
+                        paire = {
+                            squelette = part, reel = ancre,
+                            offsetPos = rel.Position,
+                        }
+                    end
+                end
+            end
+        end
+
+        if paire then
+            pairDe[part] = paire
+            table.insert(paires, paire)
+        end
+    end
+    return paires
+end
+
+-- Accessoires du squelette : suivent la partie du corps où ils sont fixés
+local function calibrerAccessoires(clone)
+    local liste = {}
+    for _, acc in ipairs(clone:GetChildren()) do
+        if acc:IsA("Accessory") then
+            local handle = acc:FindFirstChild("Handle")
+            local porte
+            for _, w in ipairs(clone:GetDescendants()) do
+                if (w:IsA("Weld") or w:IsA("WeldConstraint"))
+                   and w.Part0 and w.Part1 then
+                    if w.Part0 == handle then
+                        porte = w.Part1
+                    elseif w.Part1 == handle then
+                        porte = w.Part0
+                    end
+                end
+            end
+            if handle and porte and porte ~= handle then
+                table.insert(liste, {
+                    handle = handle, porte = porte,
+                    offset = porte.CFrame:Inverse() * handle.CFrame,
+                })
+            end
+        end
+    end
+    return liste
+end
+
+-- Le Humanoid n'est PAS obligatoire (perso custom du jeu)
+local function creerClone(player, character)
+    local ancien = clones[player]
+    if ancien and ancien.char == character and ancien.model
+       and ancien.model.Parent then
+        return
+    end
+    detruireClone(player)
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local racine = trouverRacine(character)
+
+    -- diagnostic : montre exactement la structure du perso du jeu
+    print(("[Skin] ℹ️ Perso de %s : %d objets | Humanoid=%s | racine=%s")
+        :format(player.Name, #character:GetDescendants(),
+            tostring(humanoid ~= nil),
+            racine and racine.Name or "AUCUNE"))
+
+    local ok, clone = pcall(function()
+        return Players:CreateHumanoidModelFromDescription(
+            description:Clone(),
+            humanoid and humanoid.RigType or Enum.HumanoidRigType.R15)
+    end)
+    if not ok or not clone then
+        warn("[Skin] ⚠️ Création du clone échouée : " .. tostring(clone))
+        return
+    end
+
+    clone.Name = "SkinSquelette"
+
+    local hum2 = clone:FindFirstChildOfClass("Humanoid")
+    if hum2 then hum2:Destroy() end
+    local couleurInitiale = getCouleur()
+    for _, s in ipairs(clone:GetDescendants()) do
+        if s:IsA("BaseScript") or s:IsA("Motor6D") then
+            s:Destroy()
+        elseif s:IsA("BasePart") then
+            s.Anchored = true
+            s.CanCollide = false
+            s.CastShadow = true
+            s.Color = couleurInitiale
+        elseif s:IsA("Decal") or s:IsA("Texture")
+              or s:IsA("SurfaceAppearance") then
+            s:Destroy()
+        end
+    end
+
+    if racine then
+        clone:PivotTo(racine.CFrame)
+    end
+    clone.Parent = workspace
+
+    local cData = {
+        model = clone,
+        char = character,
+        sync = nil,
+        paires = {},
+        accessoires = {},
+    }
+
+    local estMoi = (player == Players.LocalPlayer)
+    local cam = workspace.CurrentCamera
+
+    cData.sync = RunService.RenderStepped:Connect(function()
+        if not clone.Parent or not character.Parent then
+            cData.sync:Disconnect()
+            clone:Destroy()
+            if clones[player] and clones[player].model == clone then
+                clones[player] = nil
+            end
+            return
+        end
+
+        for _, paire in ipairs(cData.paires) do
+            local sq, reel = paire.squelette, paire.reel
+            if sq.Parent then
+                if paire.offset and reel and reel.Parent then
+                    -- nom exact : copie directe de la partie réelle
+                    sq.CFrame = reel.CFrame * paire.offset
+                elseif paire.suitPart and paire.suitPart.Parent then
+                    -- chaîne : suit son segment parent squelette
+                    -- -> mains / pieds / segments TOUJOURS rattachés
+                    sq.CFrame = paire.suitPart.CFrame * paire.offsetChaine
+                elseif reel and reel.Parent and paire.offsetPos then
+                    -- ancre : position seule, orientation du réel
+                    sq.CFrame = reel.CFrame * CFrame.new(paire.offsetPos)
+                end
+            end
+        end
+
+        for _, paire in ipairs(cData.accessoires) do
+            if paire.handle.Parent and paire.porte.Parent then
+                paire.handle.CFrame = paire.porte.CFrame * paire.offset
+            end
+        end
+
+        -- en vue première personne, cache ton propre squelette
+        if estMoi and cam and racine and racine.Parent then
+            local dist = (cam.CFrame.Position - racine.Position).Magnitude
+            for _, paire in ipairs(cData.paires) do
+                paire.squelette.LocalTransparencyModifier = (dist > 4) and 0 or 1
+            end
+            for _, paire in ipairs(cData.accessoires) do
+                paire.handle.LocalTransparencyModifier = (dist > 4) and 0 or 1
+            end
+        end
+    end)
+
+    clones[player] = cData
+
+    cData.paires = calibrerPaires(character, clone)
+    cData.accessoires = calibrerAccessoires(clone)
+
+    print("[Skin] 💀 Clone squelette créé pour " .. player.Name)
+end
+
+-- Refresh (manuel, touche P) : répare uniquement les associations mortes,
+-- re-cache le vrai perso, remet la couleur
+local function rafraichir(player)
+    local c = clones[player]
+    if not c or not c.model or not c.model.Parent then return end
+    local character = c.char
+    if not character or not character.Parent then return end
+
+    c.paires = calibrerPaires(character, c.model, c.paires)
+    c.accessoires = calibrerAccessoires(c.model)
+
+    for _, obj in ipairs(character:GetDescendants()) do
+        if not estDansUnTool(obj) then
+            cacherObjet(obj)
+        end
+    end
+
+    local couleur = getCouleur()
+    for _, s in ipairs(c.model:GetDescendants()) do
+        if s:IsA("BasePart") then
+            s.Color = couleur
+        end
+    end
+end
+
+--────────────────────────────────────────────
+-- 5) Panel secret (aucune indication à l'écran)
+--────────────────────────────────────────────
+
+pcall(function()
+    local vieux = game:GetService("CoreGui"):FindFirstChild("UiSqueletteRC")
+    if vieux then vieux:Destroy() end
+end)
+
+local pgui
+pcall(function()
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "UiSqueletteRC"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 9999
+    sg.Parent = game:GetService("CoreGui")
+    pgui = sg
+end)
+if not pgui then
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "UiSqueletteRC"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 9999
+    sg.Parent = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    pgui = sg
+end
+
+local panel = Instance.new("Frame")
+panel.Size = UDim2.fromOffset(116, 72)
+panel.Position = UDim2.new(0.5, -58, 0.6, 0)
+panel.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+panel.BackgroundTransparency = 0.2
+panel.BorderSizePixel = 0
+panel.Visible = false
+panel.Active = true
+panel.Draggable = true
+panel.Parent = pgui
+
+local coins = Instance.new("UICorner")
+coins.CornerRadius = UDim.new(0, 8)
+coins.Parent = panel
+
+local definitionsBoutons = {
+    { mode = "blanc",  couleur = COULEURS.blanc  },
+    { mode = "bleu",   couleur = COULEURS.bleu   },
+    { mode = "rouge",  couleur = COULEURS.rouge  },
+    { mode = "violet", couleur = COULEURS.violet },
+    { mode = "rgb",    couleur = Color3.fromRGB(255, 0, 0) },
+    { mode = "galaxy", couleur = Color3.fromRGB(90, 50, 170) },
+}
+
+local btnRGB
+for i, info in ipairs(definitionsBoutons) do
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(34, 28)
+    b.Position = UDim2.fromOffset(
+        4 + ((i - 1) % 3) * 37,
+        4 + math.floor((i - 1) / 3) * 34)
+    b.BackgroundColor3 = info.couleur
+    b.Text = ""
+    b.BorderSizePixel = 0
+    b.AutoButtonColor = false
+    b.Parent = panel
+
+    local cBtn = Instance.new("UICorner")
+    cBtn.CornerRadius = UDim.new(0, 6)
+    cBtn.Parent = b
+
+    b.MouseButton1Click:Connect(function()
+        modeCouleur = info.mode
+        appliquerCouleur()
+    end)
+
+    if info.mode == "rgb" then
+        btnRGB = b
+    end
+end
+
+--────────────────────────────────────────────
+-- 5bis) Rappel écran "P pour refresh"
+--   toutes les 15 s, affiché 3 s,
+--   animé à l'apparition et à la disparition
+--────────────────────────────────────────────
+
+local rappel = Instance.new("TextLabel")
+rappel.Name = "RappelRefresh"
+rappel.AnchorPoint = Vector2.new(0.5, 1)
+rappel.Size = UDim2.fromOffset(360, 38)
+rappel.Position = UDim2.new(0.5, 0, 1, -64)
+rappel.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+rappel.BackgroundTransparency = 1
+rappel.TextColor3 = Color3.fromRGB(255, 255, 255)
+rappel.Text = "💀 Appuie sur P pour rafraîchir ton skin"
+rappel.Font = Enum.Font.GothamBold
+rappel.TextSize = 15
+rappel.TextTransparency = 1
+rappel.Visible = false
+rappel.Parent = pgui
+
+local coinsRappel = Instance.new("UICorner")
+coinsRappel.CornerRadius = UDim.new(0, 8)
+coinsRappel.Parent = rappel
+
+task.spawn(function()
+    if not RAPPEL_ACTIF then return end
+    while true do
+        task.wait(RAPPEL_INTERVALLE)
+        pcall(function()
+            rappel.Visible = true
+            local tIn = TweenService:Create(rappel,
+                TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                { TextTransparency = 0, BackgroundTransparency = 0.25 })
+            tIn:Play()
+
+            task.wait(RAPPEL_DUREE)
+
+            local tOut = TweenService:Create(rappel,
+                TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+                { TextTransparency = 1, BackgroundTransparency = 1 })
+            tOut:Play()
+            tOut.Completed:Wait()
+            rappel.Visible = false
+        end)
+    end
+end)
+
+--────────────────────────────────────────────
+-- 6) Boucle couleurs animées (RGB / Galaxy)
+--────────────────────────────────────────────
+
+task.spawn(function()
+    while true do
+        task.wait(0.06)
+        if modeCouleur == "rgb" or modeCouleur == "galaxy" then
+            appliquerCouleur()
+            if btnRGB and btnRGB.Parent then
+                btnRGB.BackgroundColor3 = getCouleur()
+            end
+        end
+    end
+end)
+
+--────────────────────────────────────────────
+-- 7) Application + surveillance (AUCUN refresh auto)
+--────────────────────────────────────────────
+
+local function appliquer(player, character)
+    if not character or not character.Parent then return end
+
+    -- 1) ON SUPPRIME TON SKIN D'ABORD, toujours,
+    --    même si le perso est custom (HumanoidRootPart absent etc.)
+    masquerPerso(character)
+
+    -- 2) puis on pose le squelette par-dessus
+    creerClone(player, character)
+end
+
+-- Refresh manuel (touche P) : recalibre les skins existants,
+-- ou les recrée s'ils ont disparu
+local function rafraichirTout()
+    local n = 0
+    for _, player in ipairs(Players:GetPlayers()) do
+        if estCible(player) and player.Character and player.Character.Parent then
+            local c = clones[player]
+            if c and c.model and c.model.Parent then
+                pcall(rafraichir, player)
+            else
+                appliquer(player, player.Character)
+            end
+            n = n + 1
+        end
+    end
+    print("[Skin] 🔄 Refresh manuel : " .. n .. " skin(s) recalibré(s) / réappliqué(s)")
+end
+
+local function surveiller(player)
+    if not estCible(player) then return end
+
+    local function onCharacter(char)
+        -- le jeu habille le perso APRÈS le spawn -> quelques passages
+        -- (l'habillage de départ reste auto ; le REFRESH, lui, est sur P)
+        task.delay(1,  function() if char.Parent then appliquer(player, char) end end)
+        task.delay(3,  function() if char.Parent then appliquer(player, char) end end)
+        task.delay(6,  function() if char.Parent then appliquer(player, char) end end)
+        task.delay(10, function() if char.Parent then appliquer(player, char) end end)
+    end
+
+    if player.Character then
+        task.spawn(onCharacter, player.Character)
+    end
+    player.CharacterAdded:Connect(function(c)
+        task.wait(0.5)
+        onCharacter(c)
+    end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    task.spawn(surveiller, p)
+end
+Players.PlayerAdded:Connect(function(p)
+    task.spawn(surveiller, p)
+end)
+
+Players.PlayerRemoving:Connect(detruireClone)
+
+--────────────────────────────────────────────
+-- 8) Touches : MAJ DROITE = panel | P = refresh
+--────────────────────────────────────────────
+
+UserInputService.InputBegan:Connect(function(input, traite)
+    if traite then return end
+    if input.KeyCode == TOUCHE_PANEL then
+        panel.Visible = not panel.Visible
+    elseif input.KeyCode == TOUCHE_REFRESH then
+        rafraichirTout()
+    end
+end)
+
+print("[Skin] 💀 Squelette RC v4.1 chargé — CIBLE=" .. tostring(CIBLE)
+    .. " | HAUTEUR=x" .. HAUTEUR
+    .. " | Refresh : touche P (manuel, plus d'auto)"
+    .. " | Rappel écran toutes les " .. tostring(RAPPEL_INTERVALLE) .. "s"
+    .. " | Panel couleurs : MAJ DROITE")
